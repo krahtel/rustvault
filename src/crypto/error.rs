@@ -10,6 +10,11 @@ pub enum CryptoError {
     KdfFailed,
     HkdfFailed,
     InvalidVaultRoot,
+
+    SigningFailed,
+    SignatureVerificationFailed,
+    InvalidSignature,
+
     VaultNotUnlocked,
     DocumentNotFound,
     StorageUnavailable,
@@ -23,6 +28,11 @@ impl fmt::Display for CryptoError {
             CryptoError::InvalidKeyLength => {
                 write!(f, "Invalid cryptographic key length")
             }
+            CryptoError::SigningFailed => write!(f, "ML-DSA signing failed"),
+            CryptoError::SignatureVerificationFailed => {
+                write!(f, "ML-DSA signature verification failed")
+            }
+            CryptoError::InvalidSignature => write!(f, "Invalid ML-DSA signature"),
 
             CryptoError::InvalidNonceLength => {
                 write!(f, "Invalid cryptographic nonce length")

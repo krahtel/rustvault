@@ -8,3 +8,4 @@ pub mod kem;
 pub mod key_derivation;
 pub mod key_wrap;
 pub mod random;
+pub mod signing;
