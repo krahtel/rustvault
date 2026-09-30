@@ -9,6 +9,7 @@ pub enum CryptoError {
     RandomGenerationFailed,
     KdfFailed,
     HkdfFailed,
+    InvalidVaultRoot,
     VaultNotUnlocked,
     DocumentNotFound,
     StorageUnavailable,
@@ -46,6 +47,7 @@ impl fmt::Display for CryptoError {
             CryptoError::HkdfFailed => {
                 write!(f, "HKDF key derivation failed")
             }
+            CryptoError::InvalidVaultRoot => write!(f, "Invalid vault root"),
 
             CryptoError::VaultNotUnlocked => {
                 write!(f, "Vault is locked")
