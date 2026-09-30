@@ -23,6 +23,7 @@ struct AddResponse {
 pub struct IpfsStorage {
     api_url: String,
     client: reqwest::Client,
+    manifest_cid: Option<String>,
 }
 
 impl IpfsStorage {
@@ -30,7 +31,11 @@ impl IpfsStorage {
         Self {
             api_url: api_url.into(),
             client: reqwest::Client::new(),
+            manifest_cid: None,
         }
+    }
+    pub fn manifest_cid(&self) -> Option<&str> {
+        self.manifest_cid.as_deref()
     }
 
     pub fn default_local() -> Self {
@@ -175,19 +180,20 @@ impl VaultStorage for IpfsStorage {
 
         let cid = self.add(data).await?;
 
-        // The CID must eventually be retained so that the manifest
-        // can be loaded again. We will add that field to IpfsStorage
-        // in the next step.
-        //
-        // For now, successfully uploading the manifest is enough
-        // to validate the IPFS integration.
-        let _ = cid;
+        self.manifest_cid = Some(cid);
 
         Ok(())
     }
 
     async fn load_manifest(&self) -> Result<EncryptedData, CryptoError> {
-        Err(CryptoError::StorageUnavailable)
+        let cid = self
+            .manifest_cid
+            .as_deref()
+            .ok_or(CryptoError::StorageUnavailable)?;
+
+        let data = self.cat(cid).await?;
+
+        serde_json::from_slice(&data).map_err(|_| CryptoError::IpfsOperationFailed)
     }
 
     async fn store_document(&mut self, document: EncryptedDocument) -> Result<String, CryptoError> {
