@@ -20,6 +20,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 hex = "0.4.3"
 hkdf = "0.13.0"
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 reqwest = {
     version = "0.12",
     default-features = false,
