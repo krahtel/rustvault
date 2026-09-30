@@ -144,6 +144,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_save_and_load_roundtrip() {
+        use crate::crypto::encryption::encrypt;
+
+        let mut storage = IpfsStorage::default_local();
+
+        let key = [42u8; 32];
+        let plaintext = b"RustVault encrypted manifest";
+
+        let encrypted_manifest = encrypt(&key, plaintext).expect("failed to encrypt manifest");
+
+        storage
+            .save_manifest(&encrypted_manifest)
+            .await
+            .expect("failed to save manifest");
+
+        let loaded_manifest = storage
+            .load_manifest()
+            .await
+            .expect("failed to load manifest");
+
+        assert_eq!(loaded_manifest.nonce, encrypted_manifest.nonce);
+        assert_eq!(loaded_manifest.ciphertext, encrypted_manifest.ciphertext);
+    }
+
+    #[tokio::test]
+    async fn manifest_save_creates_cid() {
+        use crate::crypto::encryption::encrypt;
+
+        let mut storage = IpfsStorage::default_local();
+
+        let key = [42u8; 32];
+        let plaintext = b"RustVault manifest CID test";
+
+        let encrypted_manifest = encrypt(&key, plaintext).expect("failed to encrypt manifest");
+
+        assert!(storage.manifest_cid().is_none());
+
+        storage
+            .save_manifest(&encrypted_manifest)
+            .await
+            .expect("failed to save manifest");
+
+        let cid = storage.manifest_cid().expect("manifest CID should exist");
+
+        assert!(!cid.is_empty());
+    }
+    #[tokio::test]
+    async fn saving_updated_manifest_changes_cid_and_loads_latest() {
+        use crate::crypto::encryption::encrypt;
+
+        let mut storage = IpfsStorage::default_local();
+
+        let key = [42u8; 32];
+
+        let manifest_a =
+            encrypt(&key, b"RustVault manifest version A").expect("failed to encrypt manifest A");
+
+        storage
+            .save_manifest(&manifest_a)
+            .await
+            .expect("failed to save manifest A");
+
+        let cid_a = storage
+            .manifest_cid()
+            .expect("manifest A CID should exist")
+            .to_string();
+
+        let manifest_b =
+            encrypt(&key, b"RustVault manifest version B").expect("failed to encrypt manifest B");
+
+        storage
+            .save_manifest(&manifest_b)
+            .await
+            .expect("failed to save manifest B");
+
+        let cid_b = storage
+            .manifest_cid()
+            .expect("manifest B CID should exist")
+            .to_string();
+
+        assert_ne!(cid_a, cid_b);
+
+        let loaded = storage
+            .load_manifest()
+            .await
+            .expect("failed to load latest manifest");
+
+        assert_eq!(loaded.nonce, manifest_b.nonce);
+        assert_eq!(loaded.ciphertext, manifest_b.ciphertext);
+    }
+
+    #[tokio::test]
     async fn encrypted_document_roundtrip() {
         let storage = IpfsStorage::default_local();
 
