@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::error::CryptoError;
 use crate::crypto::signing::{sign, verify, MlDsaSigningKey, MlDsaVerifyingKey};
+use crate::vault::identity::VaultIdentity;
 
 pub const VAULT_ROOT_VERSION: u8 = 1;
 
@@ -31,6 +32,46 @@ struct SignableVaultRoot<'a> {
 }
 
 impl VaultRoot {
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+    pub fn create_from_identity(
+        vault_id: impl Into<String>,
+        manifest_cid: impl Into<String>,
+        identity: &VaultIdentity,
+    ) -> Result<Self, CryptoError> {
+        let vault_id = vault_id.into();
+        let manifest_cid = manifest_cid.into();
+
+        if vault_id.is_empty() || manifest_cid.is_empty() {
+            return Err(CryptoError::InvalidVaultRoot);
+        }
+
+        let signable = SignableVaultRoot {
+            version: VAULT_ROOT_VERSION,
+            manifest_cid: &manifest_cid,
+            vault_id: &vault_id,
+        };
+
+        let signable_bytes =
+            serde_json::to_vec(&signable).map_err(|_| CryptoError::InvalidVaultRoot)?;
+
+        let signature = identity.sign(&signable_bytes)?;
+
+        let verifying_key = identity.verifying_key().encode().to_vec();
+
+        Ok(Self {
+            version: VAULT_ROOT_VERSION,
+            manifest_cid,
+            vault_id,
+            verifying_key,
+            signature,
+        })
+    }
     pub fn new(
         vault_id: impl Into<String>,
         manifest_cid: impl Into<String>,
@@ -179,6 +220,30 @@ mod tests {
             .expect("failed to create vault root");
 
         assert_eq!(root.version, VAULT_ROOT_VERSION);
+    }
+    #[test]
+    fn root_can_be_created_from_vault_identity() {
+        let identity = VaultIdentity::generate();
+
+        let root = VaultRoot::create_from_identity("test-vault", "bafy-test-manifest", &identity)
+            .expect("root creation should succeed");
+
+        assert_eq!(root.vault_id(), "test-vault");
+        assert_eq!(root.manifest_cid, "bafy-test-manifest");
+
+        root.validate().expect("root signature should validate");
+    }
+    #[test]
+    fn root_created_from_identity_detects_tampering() {
+        let identity = VaultIdentity::generate();
+
+        let mut root =
+            VaultRoot::create_from_identity("test-vault", "bafy-test-manifest", &identity)
+                .expect("root creation should succeed");
+
+        root.manifest_cid = "bafy-modified-manifest".to_string();
+
+        assert!(root.validate().is_err());
     }
 
     #[test]

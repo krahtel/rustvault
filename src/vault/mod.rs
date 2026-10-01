@@ -1,3 +1,4 @@
+pub mod identity;
 pub mod ipfs;
 pub mod manager;
 pub mod manifest;
