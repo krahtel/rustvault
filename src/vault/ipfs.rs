@@ -267,16 +267,15 @@ mod tests {
 }
 #[async_trait::async_trait]
 impl VaultStorage for IpfsStorage {
-    async fn save_manifest(&mut self, manifest: &EncryptedData) -> Result<(), CryptoError> {
+    async fn save_manifest(&mut self, manifest: &EncryptedData) -> Result<String, CryptoError> {
         let data = serde_json::to_vec(manifest).map_err(|_| CryptoError::IpfsOperationFailed)?;
 
         let cid = self.add(data).await?;
 
-        self.manifest_cid = Some(cid);
+        self.manifest_cid = Some(cid.clone());
 
-        Ok(())
+        Ok(cid)
     }
-
     async fn load_manifest(&self) -> Result<EncryptedData, CryptoError> {
         let cid = self
             .manifest_cid
