@@ -11,6 +11,7 @@ pub struct VaultManager<S: VaultStorage> {
     keys: VaultKeySet,
     manifest: VaultManifest,
     encrypted_manifest: EncryptedData,
+    manifest_cid: String,
     storage: S,
     unlocked: bool,
 }
@@ -28,14 +29,15 @@ impl<S: VaultStorage> VaultManager<S> {
 
         let encrypted_manifest = Self::encrypt_manifest(&keys.manifest_key, &manifest)?;
 
-        // Store the initial encrypted manifest.
-        storage.save_manifest(&encrypted_manifest).await?;
+        // Store the initial encrypted manifest and capture its CID.
+        let manifest_cid = storage.save_manifest(&encrypted_manifest).await?;
 
         Ok(Self {
             salt,
             keys,
             manifest,
             encrypted_manifest,
+            manifest_cid,
             storage,
             unlocked: true,
         })
@@ -67,6 +69,7 @@ impl<S: VaultStorage> VaultManager<S> {
             keys,
             manifest,
             encrypted_manifest: encrypted_manifest.clone(),
+            manifest_cid: String::new(),
             storage,
             unlocked: true,
         })
@@ -92,6 +95,7 @@ impl<S: VaultStorage> VaultManager<S> {
             keys,
             manifest,
             encrypted_manifest,
+            manifest_cid: String::new(),
             storage,
             unlocked: true,
         })
@@ -126,7 +130,7 @@ impl<S: VaultStorage> VaultManager<S> {
         };
 
         // Store the encrypted document.
-        // The storage backend generates and returns the CID.
+        // The storage backend generates and returns the document CID.
         let cid = self.storage.store_document(encrypted_document).await?;
 
         // Encrypt document metadata.
@@ -226,6 +230,15 @@ impl<S: VaultStorage> VaultManager<S> {
         &self.salt
     }
 
+    /// Return the current manifest CID.
+    pub fn manifest_cid(&self) -> Result<&str, CryptoError> {
+        if !self.unlocked {
+            return Err(CryptoError::VaultNotUnlocked);
+        }
+
+        Ok(&self.manifest_cid)
+    }
+
     /// Return the decrypted manifest.
     pub fn manifest(&self) -> Result<&VaultManifest, CryptoError> {
         if !self.unlocked {
@@ -272,6 +285,9 @@ impl<S: VaultStorage> VaultManager<S> {
     }
 
     /// Encrypt and save the current manifest.
+    ///
+    /// Saving the manifest creates a new CID in content-addressed
+    /// storage. The manager therefore updates its current manifest CID.
     pub async fn save_manifest(&mut self) -> Result<(), CryptoError> {
         if !self.unlocked {
             return Err(CryptoError::VaultNotUnlocked);
@@ -279,7 +295,9 @@ impl<S: VaultStorage> VaultManager<S> {
 
         self.encrypted_manifest = Self::encrypt_manifest(&self.keys.manifest_key, &self.manifest)?;
 
-        self.storage.save_manifest(&self.encrypted_manifest).await?;
+        let manifest_cid = self.storage.save_manifest(&self.encrypted_manifest).await?;
+
+        self.manifest_cid = manifest_cid;
 
         Ok(())
     }
@@ -299,6 +317,8 @@ mod tests {
         assert!(vault.is_unlocked());
 
         assert_eq!(vault.manifest().unwrap().document_count(), 0);
+
+        assert!(!vault.manifest_cid().unwrap().is_empty());
     }
 
     #[test]
@@ -381,6 +401,8 @@ mod tests {
             .expect("manifest save should succeed");
 
         assert!(!vault.encrypted_manifest().ciphertext.is_empty());
+
+        assert!(!vault.manifest_cid().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -394,6 +416,7 @@ mod tests {
         assert!(vault.manifest().is_err());
         assert!(vault.manifest_mut().is_err());
         assert!(vault.document_key().is_err());
+        assert!(vault.manifest_cid().is_err());
     }
 
     #[tokio::test]
@@ -430,6 +453,27 @@ mod tests {
             .expect("document should exist");
 
         assert_eq!(entry.ipfs_cid, cid);
+    }
+
+    #[tokio::test]
+    async fn adding_document_updates_manifest_cid() {
+        let mut vault = VaultManager::create(b"test-password", MemoryStorage::new())
+            .await
+            .expect("vault creation should succeed");
+
+        let initial_cid = vault
+            .manifest_cid()
+            .expect("manifest CID should exist")
+            .to_string();
+
+        vault
+            .add_document("document-001".to_string(), b"secret document")
+            .await
+            .expect("document should be added");
+
+        let updated_cid = vault.manifest_cid().expect("manifest CID should exist");
+
+        assert_ne!(initial_cid, updated_cid);
     }
 
     #[tokio::test]
@@ -665,6 +709,7 @@ mod tests {
             keys,
             manifest,
             encrypted_manifest,
+            manifest_cid: String::new(),
             storage: MemoryStorage::new(),
             unlocked: true,
         }
