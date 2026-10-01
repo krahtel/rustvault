@@ -12,27 +12,15 @@ pub struct ManifestStorageRecord {
 
 #[async_trait::async_trait]
 pub trait VaultStorage {
-    async fn save_manifest(
-        &mut self,
-        manifest: &EncryptedData,
-    ) -> Result<String, CryptoError>;
+    async fn save_manifest(&mut self, manifest: &EncryptedData) -> Result<String, CryptoError>;
 
     async fn load_manifest(&self) -> Result<ManifestStorageRecord, CryptoError>;
 
-    async fn store_document(
-        &mut self,
-        document: EncryptedDocument,
-    ) -> Result<String, CryptoError>;
+    async fn store_document(&mut self, document: EncryptedDocument) -> Result<String, CryptoError>;
 
-    async fn load_document(
-        &self,
-        cid: &str,
-    ) -> Result<EncryptedDocument, CryptoError>;
+    async fn load_document(&self, cid: &str) -> Result<EncryptedDocument, CryptoError>;
 
-    async fn delete_document(
-        &mut self,
-        cid: &str,
-    ) -> Result<(), CryptoError>;
+    async fn delete_document(&mut self, cid: &str) -> Result<(), CryptoError>;
 }
 
 #[derive(Default)]
@@ -56,10 +44,7 @@ impl MemoryStorage {
 
 #[async_trait::async_trait]
 impl VaultStorage for MemoryStorage {
-    async fn save_manifest(
-        &mut self,
-        manifest: &EncryptedData,
-    ) -> Result<String, CryptoError> {
+    async fn save_manifest(&mut self, manifest: &EncryptedData) -> Result<String, CryptoError> {
         let cid = format!("memory-manifest-{}", self.documents.len());
 
         self.manifest = Some(ManifestStorageRecord {
@@ -71,15 +56,10 @@ impl VaultStorage for MemoryStorage {
     }
 
     async fn load_manifest(&self) -> Result<ManifestStorageRecord, CryptoError> {
-        self.manifest
-            .clone()
-            .ok_or(CryptoError::StorageUnavailable)
+        self.manifest.clone().ok_or(CryptoError::StorageUnavailable)
     }
 
-    async fn store_document(
-        &mut self,
-        document: EncryptedDocument,
-    ) -> Result<String, CryptoError> {
+    async fn store_document(&mut self, document: EncryptedDocument) -> Result<String, CryptoError> {
         let cid = format!("memory-{}", self.documents.len() + 1);
 
         self.documents.insert(cid.clone(), document);
@@ -87,20 +67,14 @@ impl VaultStorage for MemoryStorage {
         Ok(cid)
     }
 
-    async fn load_document(
-        &self,
-        cid: &str,
-    ) -> Result<EncryptedDocument, CryptoError> {
+    async fn load_document(&self, cid: &str) -> Result<EncryptedDocument, CryptoError> {
         self.documents
             .get(cid)
             .cloned()
             .ok_or(CryptoError::DocumentNotFound)
     }
 
-    async fn delete_document(
-        &mut self,
-        cid: &str,
-    ) -> Result<(), CryptoError> {
+    async fn delete_document(&mut self, cid: &str) -> Result<(), CryptoError> {
         self.documents
             .remove(cid)
             .ok_or(CryptoError::DocumentNotFound)?;

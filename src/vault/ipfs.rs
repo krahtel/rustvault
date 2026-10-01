@@ -1,7 +1,8 @@
 use crate::crypto::encrypted_document::EncryptedDocument;
 use crate::crypto::encryption::EncryptedData;
 use crate::crypto::error::CryptoError;
-use crate::vault::storage::VaultStorage;
+use crate::vault::storage::{ManifestStorageRecord, VaultStorage};
+
 use reqwest::multipart;
 use serde::Deserialize;
 
@@ -34,6 +35,7 @@ impl IpfsStorage {
             manifest_cid: None,
         }
     }
+
     pub fn manifest_cid(&self) -> Option<&str> {
         self.manifest_cid.as_deref()
     }
@@ -102,7 +104,9 @@ impl IpfsStorage {
         &self,
         document: &EncryptedDocument,
     ) -> Result<String, CryptoError> {
-        let data = serde_json::to_vec(document).map_err(|_| CryptoError::IpfsOperationFailed)?;
+        let data =
+            serde_json::to_vec(document)
+                .map_err(|_| CryptoError::IpfsOperationFailed)?;
 
         self.add(data).await
     }
@@ -114,7 +118,70 @@ impl IpfsStorage {
     ) -> Result<EncryptedDocument, CryptoError> {
         let data = self.cat(cid).await?;
 
-        serde_json::from_slice(&data).map_err(|_| CryptoError::IpfsOperationFailed)
+        serde_json::from_slice(&data)
+            .map_err(|_| CryptoError::IpfsOperationFailed)
+    }
+}
+
+#[async_trait::async_trait]
+impl VaultStorage for IpfsStorage {
+    async fn save_manifest(
+        &mut self,
+        manifest: &EncryptedData,
+    ) -> Result<String, CryptoError> {
+        let data =
+            serde_json::to_vec(manifest)
+                .map_err(|_| CryptoError::IpfsOperationFailed)?;
+
+        let cid = self.add(data).await?;
+
+        self.manifest_cid = Some(cid.clone());
+
+        Ok(cid)
+    }
+
+    async fn load_manifest(
+        &self,
+    ) -> Result<ManifestStorageRecord, CryptoError> {
+        let cid = self
+            .manifest_cid
+            .as_deref()
+            .ok_or(CryptoError::StorageUnavailable)?;
+
+        let data = self.cat(cid).await?;
+
+        let encrypted_manifest: EncryptedData =
+            serde_json::from_slice(&data)
+                .map_err(|_| CryptoError::IpfsOperationFailed)?;
+
+        Ok(ManifestStorageRecord {
+            cid: cid.to_string(),
+            encrypted_manifest,
+        })
+    }
+
+    async fn store_document(
+        &mut self,
+        document: EncryptedDocument,
+    ) -> Result<String, CryptoError> {
+        self.add_encrypted_document(&document).await
+    }
+
+    async fn load_document(
+        &self,
+        cid: &str,
+    ) -> Result<EncryptedDocument, CryptoError> {
+        self.get_encrypted_document(cid).await
+    }
+
+    async fn delete_document(
+        &mut self,
+        _cid: &str,
+    ) -> Result<(), CryptoError> {
+        // IPFS content is immutable/content-addressed.
+        // Removing a local reference does not delete the content
+        // from the IPFS network.
+        Ok(())
     }
 }
 
@@ -126,7 +193,8 @@ mod tests {
     async fn add_and_cat_roundtrip() {
         let storage = IpfsStorage::default_local();
 
-        let original = b"RustVault IPFS integration test".to_vec();
+        let original =
+            b"RustVault IPFS integration test".to_vec();
 
         let cid = storage
             .add(original.clone())
@@ -147,14 +215,19 @@ mod tests {
     async fn manifest_save_and_load_roundtrip() {
         use crate::crypto::encryption::encrypt;
 
-        let mut storage = IpfsStorage::default_local();
+        let mut storage =
+            IpfsStorage::default_local();
 
         let key = [42u8; 32];
-        let plaintext = b"RustVault encrypted manifest";
 
-        let encrypted_manifest = encrypt(&key, plaintext).expect("failed to encrypt manifest");
+        let plaintext =
+            b"RustVault encrypted manifest";
 
-        storage
+        let encrypted_manifest =
+            encrypt(&key, plaintext)
+                .expect("failed to encrypt manifest");
+
+        let saved_cid = storage
             .save_manifest(&encrypted_manifest)
             .await
             .expect("failed to save manifest");
@@ -164,42 +237,69 @@ mod tests {
             .await
             .expect("failed to load manifest");
 
-        assert_eq!(loaded_manifest.nonce, encrypted_manifest.nonce);
-        assert_eq!(loaded_manifest.ciphertext, encrypted_manifest.ciphertext);
+        assert_eq!(
+            loaded_manifest.cid,
+            saved_cid
+        );
+
+        assert_eq!(
+            loaded_manifest.encrypted_manifest.nonce,
+            encrypted_manifest.nonce
+        );
+
+        assert_eq!(
+            loaded_manifest.encrypted_manifest.ciphertext,
+            encrypted_manifest.ciphertext
+        );
     }
 
     #[tokio::test]
     async fn manifest_save_creates_cid() {
         use crate::crypto::encryption::encrypt;
 
-        let mut storage = IpfsStorage::default_local();
+        let mut storage =
+            IpfsStorage::default_local();
 
         let key = [42u8; 32];
-        let plaintext = b"RustVault manifest CID test";
 
-        let encrypted_manifest = encrypt(&key, plaintext).expect("failed to encrypt manifest");
+        let plaintext =
+            b"RustVault manifest CID test";
 
-        assert!(storage.manifest_cid().is_none());
+        let encrypted_manifest =
+            encrypt(&key, plaintext)
+                .expect("failed to encrypt manifest");
+
+        assert!(
+            storage.manifest_cid().is_none()
+        );
 
         storage
             .save_manifest(&encrypted_manifest)
             .await
             .expect("failed to save manifest");
 
-        let cid = storage.manifest_cid().expect("manifest CID should exist");
+        let cid = storage
+            .manifest_cid()
+            .expect("manifest CID should exist");
 
         assert!(!cid.is_empty());
     }
+
     #[tokio::test]
     async fn saving_updated_manifest_changes_cid_and_loads_latest() {
         use crate::crypto::encryption::encrypt;
 
-        let mut storage = IpfsStorage::default_local();
+        let mut storage =
+            IpfsStorage::default_local();
 
         let key = [42u8; 32];
 
         let manifest_a =
-            encrypt(&key, b"RustVault manifest version A").expect("failed to encrypt manifest A");
+            encrypt(
+                &key,
+                b"RustVault manifest version A",
+            )
+            .expect("failed to encrypt manifest A");
 
         storage
             .save_manifest(&manifest_a)
@@ -212,7 +312,11 @@ mod tests {
             .to_string();
 
         let manifest_b =
-            encrypt(&key, b"RustVault manifest version B").expect("failed to encrypt manifest B");
+            encrypt(
+                &key,
+                b"RustVault manifest version B",
+            )
+            .expect("failed to encrypt manifest B");
 
         storage
             .save_manifest(&manifest_b)
@@ -226,24 +330,43 @@ mod tests {
 
         assert_ne!(cid_a, cid_b);
 
-        let loaded = storage
-            .load_manifest()
-            .await
-            .expect("failed to load latest manifest");
+        let loaded =
+            storage
+                .load_manifest()
+                .await
+                .expect("failed to load latest manifest");
 
-        assert_eq!(loaded.nonce, manifest_b.nonce);
-        assert_eq!(loaded.ciphertext, manifest_b.ciphertext);
+        assert_eq!(
+            loaded.cid,
+            cid_b
+        );
+
+        assert_eq!(
+            loaded.encrypted_manifest.nonce,
+            manifest_b.nonce
+        );
+
+        assert_eq!(
+            loaded.encrypted_manifest.ciphertext,
+            manifest_b.ciphertext
+        );
     }
 
     #[tokio::test]
     async fn encrypted_document_roundtrip() {
-        let storage = IpfsStorage::default_local();
+        let storage =
+            IpfsStorage::default_local();
 
         let wrapping_key = [42u8; 32];
 
-        let plaintext = b"This is a secret RustVault document.";
+        let plaintext =
+            b"This is a secret RustVault document.";
 
-        let encrypted = EncryptedDocument::encrypt(&wrapping_key, plaintext)
+        let encrypted =
+            EncryptedDocument::encrypt(
+                &wrapping_key,
+                plaintext,
+            )
             .expect("failed to encrypt document");
 
         let cid = storage
@@ -263,42 +386,5 @@ mod tests {
             .expect("failed to decrypt document");
 
         assert_eq!(decrypted, plaintext);
-    }
-}
-#[async_trait::async_trait]
-impl VaultStorage for IpfsStorage {
-    async fn save_manifest(&mut self, manifest: &EncryptedData) -> Result<String, CryptoError> {
-        let data = serde_json::to_vec(manifest).map_err(|_| CryptoError::IpfsOperationFailed)?;
-
-        let cid = self.add(data).await?;
-
-        self.manifest_cid = Some(cid.clone());
-
-        Ok(cid)
-    }
-    async fn load_manifest(&self) -> Result<EncryptedData, CryptoError> {
-        let cid = self
-            .manifest_cid
-            .as_deref()
-            .ok_or(CryptoError::StorageUnavailable)?;
-
-        let data = self.cat(cid).await?;
-
-        serde_json::from_slice(&data).map_err(|_| CryptoError::IpfsOperationFailed)
-    }
-
-    async fn store_document(&mut self, document: EncryptedDocument) -> Result<String, CryptoError> {
-        self.add_encrypted_document(&document).await
-    }
-
-    async fn load_document(&self, cid: &str) -> Result<EncryptedDocument, CryptoError> {
-        self.get_encrypted_document(cid).await
-    }
-
-    async fn delete_document(&mut self, _cid: &str) -> Result<(), CryptoError> {
-        // IPFS content is immutable/content-addressed. Deleting a
-        // local reference does not delete the content from the
-        // network.
-        Ok(())
     }
 }
