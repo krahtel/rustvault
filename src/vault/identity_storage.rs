@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 use crate::crypto::encryption::{decrypt, encrypt, EncryptedData};
 use crate::crypto::error::CryptoError;
 use crate::crypto::key_derivation::KEY_LEN;
 use crate::crypto::signing::{MlDsaSigningKey, MlDsaVerifyingKey, SigningKeyPair};
+
 pub struct ProtectedVaultIdentity {
     encrypted_seed: EncryptedData,
     verifying_key: Vec<u8>,
@@ -49,6 +52,33 @@ impl ProtectedVaultIdentity {
         ))
     }
 }
+
+/// Serializable representation of a protected vault identity.
+///
+/// The ML-DSA signing seed is never stored directly.
+/// It is contained inside `encrypted_seed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityStorageRecord {
+    pub encrypted_seed: EncryptedData,
+    pub verifying_key: Vec<u8>,
+}
+
+impl IdentityStorageRecord {
+    pub fn from_protected_identity(identity: &ProtectedVaultIdentity) -> Self {
+        Self {
+            encrypted_seed: identity.encrypted_seed().clone(),
+            verifying_key: identity.verifying_key_bytes().to_vec(),
+        }
+    }
+
+    pub fn to_protected_identity(&self) -> ProtectedVaultIdentity {
+        ProtectedVaultIdentity {
+            encrypted_seed: self.encrypted_seed.clone(),
+            verifying_key: self.verifying_key.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +105,7 @@ mod tests {
             .expect("identity protection should succeed");
 
         assert!(!protected.encrypted_seed().ciphertext.is_empty());
+
         assert!(!protected.verifying_key_bytes().is_empty());
     }
 
@@ -203,5 +234,53 @@ mod tests {
             restored_verifying_key.encode(),
             identity.verifying_key.encode()
         );
+    }
+
+    #[test]
+    fn identity_storage_record_roundtrip() {
+        let identity = generate_keypair();
+        let key = test_key();
+
+        let protected = ProtectedVaultIdentity::protect(&key, &identity)
+            .expect("identity protection should succeed");
+
+        let record = IdentityStorageRecord::from_protected_identity(&protected);
+
+        let serialized = serde_json::to_vec(&record).expect("identity record should serialize");
+
+        let restored_record: IdentityStorageRecord =
+            serde_json::from_slice(&serialized).expect("identity record should deserialize");
+
+        let restored = restored_record.to_protected_identity();
+
+        let restored_signing_key = restored
+            .unlock_signing_key(&key)
+            .expect("restored identity should unlock");
+
+        let message = b"RustVault identity storage roundtrip";
+
+        let signature = crate::crypto::signing::sign(&restored_signing_key, message)
+            .expect("restored identity should sign");
+
+        verify(&identity.verifying_key, message, &signature)
+            .expect("original verifying key should verify restored signature");
+    }
+
+    #[test]
+    fn identity_storage_record_preserves_verifying_key() {
+        let identity = generate_keypair();
+        let key = test_key();
+
+        let protected = ProtectedVaultIdentity::protect(&key, &identity)
+            .expect("identity protection should succeed");
+
+        let record = IdentityStorageRecord::from_protected_identity(&protected);
+
+        let serialized = serde_json::to_vec(&record).expect("identity record should serialize");
+
+        let restored_record: IdentityStorageRecord =
+            serde_json::from_slice(&serialized).expect("identity record should deserialize");
+
+        assert_eq!(record.verifying_key, restored_record.verifying_key);
     }
 }

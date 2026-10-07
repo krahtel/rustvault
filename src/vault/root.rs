@@ -11,6 +11,7 @@ pub const VAULT_ROOT_VERSION: u8 = 1;
 pub struct VaultRoot {
     pub version: u8,
     pub manifest_cid: String,
+    pub identity_cid: String,
     pub vault_id: String,
 
     /// ML-DSA-65 public verification key.
@@ -28,6 +29,7 @@ pub struct VaultRoot {
 struct SignableVaultRoot<'a> {
     version: u8,
     manifest_cid: &'a str,
+    identity_cid: &'a str,
     vault_id: &'a str,
 }
 
@@ -39,21 +41,32 @@ impl VaultRoot {
     pub fn version(&self) -> u8 {
         self.version
     }
+
+    pub fn identity_cid(&self) -> &str {
+        &self.identity_cid
+    }
+
     pub fn create_from_identity(
         vault_id: impl Into<String>,
         manifest_cid: impl Into<String>,
+        identity_cid: impl Into<String>,
         identity: &VaultIdentity,
     ) -> Result<Self, CryptoError> {
         let vault_id = vault_id.into();
         let manifest_cid = manifest_cid.into();
+        let identity_cid = identity_cid.into();
 
-        if vault_id.is_empty() || manifest_cid.is_empty() {
+        if vault_id.trim().is_empty()
+            || manifest_cid.trim().is_empty()
+            || identity_cid.trim().is_empty()
+        {
             return Err(CryptoError::InvalidVaultRoot);
         }
 
         let signable = SignableVaultRoot {
             version: VAULT_ROOT_VERSION,
             manifest_cid: &manifest_cid,
+            identity_cid: &identity_cid,
             vault_id: &vault_id,
         };
 
@@ -67,18 +80,22 @@ impl VaultRoot {
         Ok(Self {
             version: VAULT_ROOT_VERSION,
             manifest_cid,
+            identity_cid,
             vault_id,
             verifying_key,
             signature,
         })
     }
+
     pub fn new(
         vault_id: impl Into<String>,
         manifest_cid: impl Into<String>,
+        identity_cid: impl Into<String>,
         signing_key: &MlDsaSigningKey,
     ) -> Result<Self, CryptoError> {
         let vault_id = vault_id.into();
         let manifest_cid = manifest_cid.into();
+        let identity_cid = identity_cid.into();
 
         if vault_id.trim().is_empty() {
             return Err(CryptoError::InvalidVaultRoot);
@@ -88,9 +105,14 @@ impl VaultRoot {
             return Err(CryptoError::InvalidVaultRoot);
         }
 
+        if identity_cid.trim().is_empty() {
+            return Err(CryptoError::InvalidVaultRoot);
+        }
+
         let signable = SignableVaultRoot {
             version: VAULT_ROOT_VERSION,
             manifest_cid: &manifest_cid,
+            identity_cid: &identity_cid,
             vault_id: &vault_id,
         };
 
@@ -104,6 +126,7 @@ impl VaultRoot {
         Ok(Self {
             version: VAULT_ROOT_VERSION,
             manifest_cid,
+            identity_cid,
             vault_id,
             verifying_key: verifying_key.encode().to_vec(),
             signature,
@@ -114,6 +137,7 @@ impl VaultRoot {
         let signable = SignableVaultRoot {
             version: self.version,
             manifest_cid: &self.manifest_cid,
+            identity_cid: &self.identity_cid,
             vault_id: &self.vault_id,
         };
 
@@ -147,6 +171,10 @@ impl VaultRoot {
             return Err(CryptoError::InvalidVaultRoot);
         }
 
+        if self.identity_cid.trim().is_empty() {
+            return Err(CryptoError::InvalidVaultRoot);
+        }
+
         if self.verifying_key.is_empty() {
             return Err(CryptoError::InvalidVaultRoot);
         }
@@ -171,16 +199,36 @@ impl VaultRoot {
 
     pub fn update_manifest_cid(
         &mut self,
-        manifest_cid: impl Into<String>,
+        manifest_cid: String,
         signing_key: &MlDsaSigningKey,
     ) -> Result<(), CryptoError> {
-        let manifest_cid = manifest_cid.into();
-
-        if manifest_cid.trim().is_empty() {
+        if manifest_cid.is_empty() {
             return Err(CryptoError::InvalidVaultRoot);
         }
 
         self.manifest_cid = manifest_cid;
+
+        let message = self.signable_bytes()?;
+
+        let signature = crate::crypto::signing::sign(signing_key, &message)?;
+
+        self.signature = signature;
+
+        Ok(())
+    }
+
+    pub fn update_identity_cid(
+        &mut self,
+        identity_cid: impl Into<String>,
+        signing_key: &MlDsaSigningKey,
+    ) -> Result<(), CryptoError> {
+        let identity_cid = identity_cid.into();
+
+        if identity_cid.trim().is_empty() {
+            return Err(CryptoError::InvalidVaultRoot);
+        }
+
+        self.identity_cid = identity_cid;
 
         let signable_bytes = self.signable_bytes()?;
 
@@ -216,30 +264,47 @@ mod tests {
     fn new_root_has_correct_version() {
         let keypair = generate_keypair();
 
-        let root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         assert_eq!(root.version, VAULT_ROOT_VERSION);
     }
+
     #[test]
     fn root_can_be_created_from_vault_identity() {
         let identity = VaultIdentity::generate();
 
-        let root = VaultRoot::create_from_identity("test-vault", "bafy-test-manifest", &identity)
-            .expect("root creation should succeed");
+        let root = VaultRoot::create_from_identity(
+            "test-vault",
+            "bafy-test-manifest",
+            "bafy-test-identity",
+            &identity,
+        )
+        .expect("root creation should succeed");
 
         assert_eq!(root.vault_id(), "test-vault");
         assert_eq!(root.manifest_cid, "bafy-test-manifest");
+        assert_eq!(root.identity_cid(), "bafy-test-identity");
 
         root.validate().expect("root signature should validate");
     }
+
     #[test]
     fn root_created_from_identity_detects_tampering() {
         let identity = VaultIdentity::generate();
 
-        let mut root =
-            VaultRoot::create_from_identity("test-vault", "bafy-test-manifest", &identity)
-                .expect("root creation should succeed");
+        let mut root = VaultRoot::create_from_identity(
+            "test-vault",
+            "bafy-test-manifest",
+            "bafy-test-identity",
+            &identity,
+        )
+        .expect("root creation should succeed");
 
         root.manifest_cid = "bafy-modified-manifest".to_string();
 
@@ -247,11 +312,31 @@ mod tests {
     }
 
     #[test]
+    fn identity_cid_is_stored_in_root() {
+        let keypair = generate_keypair();
+
+        let root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
+
+        assert_eq!(root.identity_cid, "QmIdentity123");
+    }
+
+    #[test]
     fn new_root_stores_vault_id_and_manifest_cid() {
         let keypair = generate_keypair();
 
-        let root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         assert_eq!(root.vault_id, "vault-001");
         assert_eq!(root.manifest_cid, "QmManifest123");
@@ -261,8 +346,13 @@ mod tests {
     fn root_serialization_roundtrip() {
         let keypair = generate_keypair();
 
-        let root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         let serialized = root.serialize().expect("failed to serialize vault root");
 
@@ -276,7 +366,7 @@ mod tests {
     fn empty_vault_id_is_rejected() {
         let keypair = generate_keypair();
 
-        let result = VaultRoot::new("", "QmManifest123", &keypair.signing_key);
+        let result = VaultRoot::new("", "QmManifest123", "QmIdentity123", &keypair.signing_key);
 
         assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
     }
@@ -285,7 +375,12 @@ mod tests {
     fn whitespace_vault_id_is_rejected() {
         let keypair = generate_keypair();
 
-        let result = VaultRoot::new("   ", "QmManifest123", &keypair.signing_key);
+        let result = VaultRoot::new(
+            "   ",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        );
 
         assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
     }
@@ -294,7 +389,7 @@ mod tests {
     fn empty_manifest_cid_is_rejected() {
         let keypair = generate_keypair();
 
-        let result = VaultRoot::new("vault-001", "", &keypair.signing_key);
+        let result = VaultRoot::new("vault-001", "", "QmIdentity123", &keypair.signing_key);
 
         assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
     }
@@ -303,7 +398,25 @@ mod tests {
     fn whitespace_manifest_cid_is_rejected() {
         let keypair = generate_keypair();
 
-        let result = VaultRoot::new("vault-001", "   ", &keypair.signing_key);
+        let result = VaultRoot::new("vault-001", "   ", "QmIdentity123", &keypair.signing_key);
+
+        assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
+    }
+
+    #[test]
+    fn empty_identity_cid_is_rejected() {
+        let keypair = generate_keypair();
+
+        let result = VaultRoot::new("vault-001", "QmManifest123", "", &keypair.signing_key);
+
+        assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
+    }
+
+    #[test]
+    fn whitespace_identity_cid_is_rejected() {
+        let keypair = generate_keypair();
+
+        let result = VaultRoot::new("vault-001", "QmManifest123", "   ", &keypair.signing_key);
 
         assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
     }
@@ -316,6 +429,7 @@ mod tests {
             version: 99,
             vault_id: "vault-001".to_string(),
             manifest_cid: "QmManifest123".to_string(),
+            identity_cid: "QmIdentity123".to_string(),
             verifying_key: keypair.verifying_key.encode().to_vec(),
             signature: Vec::new(),
         };
@@ -337,6 +451,7 @@ mod tests {
         let data = br#"{
             "version": 99,
             "manifest_cid": "QmManifest123",
+            "identity_cid": "QmIdentity123",
             "vault_id": "vault-001",
             "verifying_key": [],
             "signature": []
@@ -351,10 +466,15 @@ mod tests {
     fn manifest_cid_can_be_updated() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
-        root.update_manifest_cid("QmManifest456", &keypair.signing_key)
+        root.update_manifest_cid("QmManifest456".to_string(), &keypair.signing_key)
             .expect("failed to update manifest CID");
 
         assert_eq!(root.manifest_cid, "QmManifest456");
@@ -367,35 +487,111 @@ mod tests {
     fn empty_updated_manifest_cid_is_rejected() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
-        let result = root.update_manifest_cid("", &keypair.signing_key);
-
+        let result = root.update_manifest_cid("".to_string(), &keypair.signing_key);
         assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
 
         assert_eq!(root.manifest_cid, "QmManifest123");
     }
 
     #[test]
+    fn identity_cid_can_be_updated() {
+        let keypair = generate_keypair();
+
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
+
+        root.update_identity_cid("QmIdentity456", &keypair.signing_key)
+            .expect("failed to update identity CID");
+
+        assert_eq!(root.identity_cid, "QmIdentity456");
+
+        root.validate()
+            .expect("updated root signature failed validation");
+    }
+
+    #[test]
+    fn empty_updated_identity_cid_is_rejected() {
+        let keypair = generate_keypair();
+
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
+
+        let result = root.update_identity_cid("", &keypair.signing_key);
+
+        assert!(matches!(result, Err(CryptoError::InvalidVaultRoot)));
+
+        assert_eq!(root.identity_cid, "QmIdentity123");
+    }
+
+    #[test]
     fn valid_root_signature_verifies() {
         let keypair = generate_keypair();
 
-        let root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         root.validate()
-            .expect("valid root signature failed verification");
+            .expect("valid root signature failed validation");
     }
 
     #[test]
     fn modified_manifest_cid_fails_validation() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         root.manifest_cid = "QmAttackerManifest".to_string();
+
+        let result = root.validate();
+
+        assert!(matches!(
+            result,
+            Err(CryptoError::SignatureVerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn modified_identity_cid_fails_validation() {
+        let keypair = generate_keypair();
+
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
+
+        root.identity_cid = "QmAttackerIdentity".to_string();
 
         let result = root.validate();
 
@@ -409,8 +605,13 @@ mod tests {
     fn modified_vault_id_fails_validation() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         root.vault_id = "attacker-vault".to_string();
 
@@ -426,10 +627,14 @@ mod tests {
     fn modified_version_fails_validation() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
-
-        root.version = 99;
+        let root = VaultRoot {
+            version: 99,
+            vault_id: "vault-001".to_string(),
+            manifest_cid: "QmManifest123".to_string(),
+            identity_cid: "QmIdentity123".to_string(),
+            verifying_key: keypair.verifying_key.encode().to_vec(),
+            signature: Vec::new(),
+        };
 
         let result = root.validate();
 
@@ -441,8 +646,13 @@ mod tests {
         let keypair_a = generate_keypair();
         let keypair_b = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair_a.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair_a.signing_key,
+        )
+        .expect("failed to create vault root");
 
         root.verifying_key = keypair_b.verifying_key.encode().to_vec();
 
@@ -458,8 +668,13 @@ mod tests {
     fn modified_signature_fails_validation() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         root.signature[0] ^= 0x01;
 
@@ -475,15 +690,45 @@ mod tests {
     fn manifest_cid_update_resigns_root() {
         let keypair = generate_keypair();
 
-        let mut root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         let original_signature = root.signature.clone();
 
-        root.update_manifest_cid("QmManifest456", &keypair.signing_key)
+        root.update_manifest_cid("QmManifest456".to_string(), &keypair.signing_key)
             .expect("failed to update manifest CID");
 
         assert_eq!(root.manifest_cid, "QmManifest456");
+
+        assert_ne!(root.signature, original_signature);
+
+        root.validate().expect("re-signed root failed validation");
+    }
+
+    #[test]
+    fn identity_cid_update_resigns_root() {
+        let keypair = generate_keypair();
+
+        let mut root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
+
+        let original_signature = root.signature.clone();
+
+        root.update_identity_cid("QmIdentity456", &keypair.signing_key)
+            .expect("failed to update identity CID");
+
+        assert_eq!(root.identity_cid, "QmIdentity456");
+
         assert_ne!(root.signature, original_signature);
 
         root.validate().expect("re-signed root failed validation");
@@ -493,8 +738,13 @@ mod tests {
     fn verifying_key_can_be_reconstructed() {
         let keypair = generate_keypair();
 
-        let root = VaultRoot::new("vault-001", "QmManifest123", &keypair.signing_key)
-            .expect("failed to create vault root");
+        let root = VaultRoot::new(
+            "vault-001",
+            "QmManifest123",
+            "QmIdentity123",
+            &keypair.signing_key,
+        )
+        .expect("failed to create vault root");
 
         let reconstructed_key = root
             .verifying_key()

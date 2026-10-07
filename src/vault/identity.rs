@@ -12,6 +12,10 @@ impl VaultIdentity {
     pub fn generate() -> Self {
         let keypair: SigningKeyPair = generate_keypair();
 
+        Self::from_keypair(keypair)
+    }
+
+    pub fn from_keypair(keypair: SigningKeyPair) -> Self {
         Self {
             signing_key: keypair.signing_key,
             verifying_key: keypair.verifying_key,
@@ -28,6 +32,13 @@ impl VaultIdentity {
 
     pub fn signing_key(&self) -> &MlDsaSigningKey {
         &self.signing_key
+    }
+
+    pub fn signing_key_pair(&self) -> SigningKeyPair {
+        SigningKeyPair {
+            signing_key: self.signing_key.clone(),
+            verifying_key: self.verifying_key.clone(),
+        }
     }
 }
 #[cfg(test)]

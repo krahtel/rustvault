@@ -36,8 +36,13 @@ mod tests {
     fn root_storage_can_save_and_load_root() {
         let identity = VaultIdentity::generate();
 
-        let root = VaultRoot::create_from_identity("test-vault", "bafy-test-manifest", &identity)
-            .expect("root creation should succeed");
+        let root = VaultRoot::create_from_identity(
+            "test-vault",
+            "bafy-test-manifest",
+            "bafy-test-identity",
+            &identity,
+        )
+        .expect("root creation should succeed");
 
         let mut storage = MemoryRootStorage::new();
 
@@ -66,8 +71,13 @@ mod tests {
     fn root_storage_preserves_signature() {
         let identity = VaultIdentity::generate();
 
-        let root = VaultRoot::create_from_identity("test-vault", "bafy-test-manifest", &identity)
-            .expect("root creation should succeed");
+        let root = VaultRoot::create_from_identity(
+            "test-vault",
+            "bafy-test-manifest",
+            "bafy-test-identity",
+            &identity,
+        )
+        .expect("root creation should succeed");
 
         let original_signature = root.signature.clone();
 
