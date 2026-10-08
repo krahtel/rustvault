@@ -125,6 +125,17 @@ impl VaultStorage for IpfsStorage {
 
         self.add_bytes(bytes).await
     }
+    async fn list_manifest_cids(&self) -> Result<Vec<String>, CryptoError> {
+        Err(CryptoError::StorageUnavailable)
+    }
+
+    async fn delete_manifest(&mut self, _cid: &str) -> Result<(), CryptoError> {
+        Err(CryptoError::StorageUnavailable)
+    }
+
+    async fn list_document_cids(&self) -> Result<Vec<String>, CryptoError> {
+        Err(CryptoError::StorageUnavailable)
+    }
 
     async fn load_root(&self) -> Result<VaultRoot, CryptoError> {
         // Root CID persistence will be connected to the

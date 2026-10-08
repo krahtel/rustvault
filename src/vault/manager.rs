@@ -37,6 +37,7 @@ impl<S: VaultStorage> VaultManager<S> {
     /// 8. Store the encrypted manifest and obtain its CID.
     /// 9. Create a signed VaultRoot containing both CIDs.
     /// 10. Store the signed VaultRoot.
+
     pub async fn create(password: &[u8], mut storage: S) -> Result<Self, CryptoError> {
         let salt = generate_salt()?;
 
@@ -224,7 +225,7 @@ impl<S: VaultStorage> VaultManager<S> {
         let encrypted_metadata = encrypt(&self.keys.document_key, document_id.as_bytes())?;
 
         let entry = ManifestEntry {
-            document_id,
+            document_id: document_id.clone(),
             ipfs_cid: cid.clone(),
             wrapped_document_key,
             encrypted_metadata,
@@ -232,7 +233,16 @@ impl<S: VaultStorage> VaultManager<S> {
 
         self.manifest.add_document(entry);
 
-        self.save_manifest().await?;
+        // The document has already been stored. If saving the manifest fails,
+        // roll back both the in-memory manifest entry and the stored document.
+        if let Err(error) = self.save_manifest().await {
+            self.manifest.remove_document(&document_id);
+
+            // Best-effort cleanup of the stored encrypted document.
+            let _ = self.storage.delete_document(&cid).await;
+
+            return Err(error);
+        }
 
         Ok(cid)
     }
@@ -255,22 +265,109 @@ impl<S: VaultStorage> VaultManager<S> {
 
         encrypted_document.decrypt(&document_key)
     }
+    pub async fn find_orphaned_documents(&self) -> Result<Vec<String>, CryptoError> {
+        self.ensure_unlocked()?;
+
+        let stored_cids = self.storage.list_document_cids().await?;
+
+        let referenced_cids: std::collections::HashSet<String> = self
+            .manifest
+            .documents
+            .iter()
+            .map(|document| document.ipfs_cid.clone())
+            .collect();
+
+        Ok(stored_cids
+            .into_iter()
+            .filter(|cid| !referenced_cids.contains(cid))
+            .collect())
+    }
+    pub async fn find_orphaned_manifests(&self) -> Result<Vec<String>, CryptoError> {
+        self.ensure_unlocked()?;
+
+        // The signed VaultRoot is the authoritative source for the
+        // currently committed manifest.
+        let current_root = self
+            .vault_root
+            .as_ref()
+            .ok_or(CryptoError::StorageUnavailable)?;
+
+        let current_manifest_cid = &current_root.manifest_cid;
+
+        // Ask storage for every manifest object currently retained.
+        let stored_cids = self.storage.list_manifest_cids().await?;
+
+        // Any stored manifest that is not the manifest referenced by the
+        // committed VaultRoot is considered an orphan.
+        Ok(stored_cids
+            .into_iter()
+            .filter(|cid| cid != current_manifest_cid)
+            .collect())
+    }
+
+    pub async fn remove_orphaned_manifest(&mut self, cid: &str) -> Result<(), CryptoError> {
+        self.ensure_unlocked()?;
+
+        // The signed VaultRoot is authoritative for the currently
+        // committed manifest. It must never be deleted.
+        let current_root = self
+            .vault_root
+            .as_ref()
+            .ok_or(CryptoError::StorageUnavailable)?;
+
+        if current_root.manifest_cid == cid {
+            return Err(CryptoError::StorageUnavailable);
+        }
+
+        // Verify that the CID is actually an orphan before allowing
+        // deletion. This prevents arbitrary manifest deletion.
+        let orphaned_manifests = self.find_orphaned_manifests().await?;
+
+        if !orphaned_manifests.iter().any(|orphan| orphan == cid) {
+            return Err(CryptoError::StorageUnavailable);
+        }
+
+        self.storage.delete_manifest(cid).await
+    }
+
+    pub async fn remove_orphaned_document(&mut self, cid: &str) -> Result<(), CryptoError> {
+        self.ensure_unlocked()?;
+
+        let orphans = self.find_orphaned_documents().await?;
+
+        if !orphans.iter().any(|orphan| orphan == cid) {
+            return Err(CryptoError::DocumentNotFound);
+        }
+
+        self.storage.delete_document(cid).await
+    }
 
     /// Delete a document from the vault.
     pub async fn delete_document(&mut self, document_id: &str) -> Result<(), CryptoError> {
         self.ensure_unlocked()?;
 
+        // Capture the manifest entry before modifying the manifest.
         let entry = self
             .manifest
             .find_document(document_id)
-            .ok_or(CryptoError::DocumentNotFound)?
-            .clone();
+            .cloned()
+            .ok_or(CryptoError::DocumentNotFound)?;
 
-        self.storage.delete_document(&entry.ipfs_cid).await?;
-
+        // Remove the entry from the in-memory manifest.
         self.manifest.remove_document(document_id);
 
-        self.save_manifest().await?;
+        // Persist the manifest change first.
+        //
+        // If this fails, restore the in-memory entry and leave the
+        // encrypted document untouched in storage.
+        if let Err(error) = self.save_manifest().await {
+            self.manifest.add_document(entry);
+            return Err(error);
+        }
+
+        // Only delete the encrypted document after the manifest has
+        // successfully committed the deletion.
+        self.storage.delete_document(&entry.ipfs_cid).await?;
 
         Ok(())
     }
@@ -301,40 +398,36 @@ impl<S: VaultStorage> VaultManager<S> {
     async fn save_manifest(&mut self) -> Result<(), CryptoError> {
         self.ensure_unlocked()?;
 
-        // A manifest update must have a signed VaultRoot so that the
-        // root can authenticate the new manifest CID.
-        if self.vault_root.is_none() {
-            return Err(CryptoError::StorageUnavailable);
-        }
-
-        // Load the protected identity from storage.
-        let identity_record = self.storage.load_identity().await?;
-
-        let protected_identity = identity_record.to_protected_identity();
-
-        // Recover the ML-DSA signing key using the password-derived
-        // identity key.
-        let signing_key = protected_identity.unlock_signing_key(&self.keys.identity_key)?;
-
-        // Encrypt the updated manifest.
-        let encrypted_manifest = Self::encrypt_manifest(&self.keys.manifest_key, &self.manifest)?;
-
-        // Persist the encrypted manifest and obtain its CID.
-        let cid = self.storage.save_manifest(&encrypted_manifest).await?;
-
-        // Update and re-sign the VaultRoot with the new manifest CID.
-        let root = self
+        let current_root = self
             .vault_root
-            .as_mut()
+            .as_ref()
             .ok_or(CryptoError::StorageUnavailable)?;
 
-        root.update_manifest_cid(cid.clone(), &signing_key)?;
+        let identity_record = self.storage.load_identity().await?;
+        let protected_identity = identity_record.to_protected_identity();
 
-        // Persist the newly signed root.
-        self.storage.save_root(root).await?;
+        let signing_key = protected_identity.unlock_signing_key(&self.keys.identity_key)?;
 
-        // Only update the manager's in-memory state after all
-        // authenticated persistence operations succeed.
+        let encrypted_manifest = Self::encrypt_manifest(&self.keys.manifest_key, &self.manifest)?;
+
+        // Store the new manifest first.
+        let cid = self.storage.save_manifest(&encrypted_manifest).await?;
+
+        let mut updated_root = current_root.clone();
+
+        updated_root.update_manifest_cid(cid.clone(), &signing_key)?;
+
+        // The manifest is now stored, but the root has not been
+        // committed yet. If root persistence fails, remove the newly
+        // stored manifest so it does not become an orphan.
+        if let Err(error) = self.storage.save_root(&updated_root).await {
+            let _ = self.storage.delete_manifest(&cid).await;
+            return Err(error);
+        }
+
+        // Only update in-memory state after both manifest and root
+        // persistence have succeeded.
+        self.vault_root = Some(updated_root);
         self.encrypted_manifest = encrypted_manifest;
         self.manifest_cid = cid;
 
@@ -472,6 +565,813 @@ mod tests {
     fn test_storage() -> MemoryStorage {
         MemoryStorage::new()
     }
+    struct FailingRootStorage {
+        inner: MemoryStorage,
+        fail_root_save: bool,
+    }
+
+    impl FailingRootStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorage::new(),
+                fail_root_save: false,
+            }
+        }
+
+        fn fail_root_save(&mut self) {
+            self.fail_root_save = true;
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_orphaned_manifest_deletes_storage_orphan() {
+        let password = b"manifest-orphan-removal-test";
+
+        let mut vault = VaultManager::create(password, test_storage())
+            .await
+            .expect("vault creation should succeed");
+
+        let current_manifest_cid = vault
+            .manifest_cid()
+            .expect("current manifest CID should exist")
+            .to_string();
+
+        let replacement_manifest = VaultManifest::new();
+
+        let orphaned_encrypted_manifest = VaultManager::<MemoryStorage>::encrypt_manifest(
+            &vault.keys.manifest_key,
+            &replacement_manifest,
+        )
+        .expect("replacement manifest encryption should succeed");
+
+        let orphaned_cid = vault
+            .storage_mut()
+            .save_manifest(&orphaned_encrypted_manifest)
+            .await
+            .expect("orphaned manifest should be stored");
+
+        assert_ne!(current_manifest_cid, orphaned_cid);
+
+        let orphans = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![orphaned_cid.clone()]);
+
+        vault
+            .remove_orphaned_manifest(&orphaned_cid)
+            .await
+            .expect("orphaned manifest should be removed");
+
+        let orphans_after_removal = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphan detection should succeed after removal");
+
+        assert!(
+            orphans_after_removal.is_empty(),
+            "removed manifest must no longer be reported as an orphan"
+        );
+    }
+    #[tokio::test]
+    async fn remove_orphaned_manifest_rejects_current_manifest() {
+        let password = b"current-manifest-protection-test";
+
+        let mut vault = VaultManager::create(password, test_storage())
+            .await
+            .expect("vault creation should succeed");
+
+        let current_manifest_cid = vault
+            .manifest_cid()
+            .expect("current manifest CID should exist")
+            .to_string();
+
+        let result = vault.remove_orphaned_manifest(&current_manifest_cid).await;
+
+        assert!(
+            result.is_err(),
+            "the committed manifest must never be removable"
+        );
+
+        let current_manifest_after = vault
+            .manifest_cid()
+            .expect("current manifest CID should still exist");
+
+        assert_eq!(
+            current_manifest_after, current_manifest_cid,
+            "current manifest must remain unchanged"
+        );
+    }
+    #[tokio::test]
+    async fn remove_orphaned_manifest_rejects_unknown_cid() {
+        let password = b"unknown-manifest-test";
+
+        let mut vault = VaultManager::create(password, test_storage())
+            .await
+            .expect("vault creation should succeed");
+
+        let result = vault
+            .remove_orphaned_manifest("memory-manifest-does-not-exist")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "unknown manifest CIDs must not be removable"
+        );
+    }
+
+    #[async_trait::async_trait]
+    impl crate::vault::storage::VaultStorage for FailingRootStorage {
+        async fn save_manifest(
+            &mut self,
+            manifest: &crate::crypto::encryption::EncryptedData,
+        ) -> Result<String, CryptoError> {
+            self.inner.save_manifest(manifest).await
+        }
+
+        async fn load_manifest(
+            &self,
+        ) -> Result<crate::vault::storage::ManifestStorageRecord, CryptoError> {
+            self.inner.load_manifest().await
+        }
+
+        async fn list_manifest_cids(&self) -> Result<Vec<String>, CryptoError> {
+            self.inner.list_manifest_cids().await
+        }
+
+        async fn delete_manifest(&mut self, cid: &str) -> Result<(), CryptoError> {
+            self.inner.delete_manifest(cid).await
+        }
+
+        async fn save_identity(
+            &mut self,
+            identity: &crate::vault::identity_storage::IdentityStorageRecord,
+        ) -> Result<String, CryptoError> {
+            self.inner.save_identity(identity).await
+        }
+
+        async fn load_identity(
+            &self,
+        ) -> Result<crate::vault::identity_storage::IdentityStorageRecord, CryptoError> {
+            self.inner.load_identity().await
+        }
+
+        async fn store_document(
+            &mut self,
+            document: crate::crypto::encrypted_document::EncryptedDocument,
+        ) -> Result<String, CryptoError> {
+            self.inner.store_document(document).await
+        }
+
+        async fn load_document(
+            &self,
+            cid: &str,
+        ) -> Result<crate::crypto::encrypted_document::EncryptedDocument, CryptoError> {
+            self.inner.load_document(cid).await
+        }
+
+        async fn delete_document(&mut self, cid: &str) -> Result<(), CryptoError> {
+            self.inner.delete_document(cid).await
+        }
+
+        async fn list_document_cids(&self) -> Result<Vec<String>, CryptoError> {
+            self.inner.list_document_cids().await
+        }
+
+        async fn save_root(
+            &mut self,
+            root: &crate::vault::root::VaultRoot,
+        ) -> Result<String, CryptoError> {
+            if self.fail_root_save {
+                return Err(CryptoError::StorageUnavailable);
+            }
+
+            self.inner.save_root(root).await
+        }
+
+        async fn load_root(&self) -> Result<crate::vault::root::VaultRoot, CryptoError> {
+            self.inner.load_root().await
+        }
+    }
+
+    struct FaultInjectingStorage {
+        inner: MemoryStorage,
+        manifest_saves_before_failure: usize,
+        fail_document_delete: bool,
+        fail_manifest_delete_enabled: bool,
+        fail_root_save_enabled: bool,
+    }
+
+    impl FaultInjectingStorage {
+        fn fail_after_manifest_saves(count: usize) -> Self {
+            Self {
+                inner: MemoryStorage::new(),
+                manifest_saves_before_failure: count,
+                fail_document_delete: false,
+                fail_manifest_delete_enabled: false,
+                fail_root_save_enabled: false,
+            }
+        }
+
+        fn fail_document_delete(&mut self) {
+            self.fail_document_delete = true;
+        }
+
+        fn clear_document_delete_failure(&mut self) {
+            self.fail_document_delete = false;
+        }
+
+        fn fail_manifest_delete(&mut self) {
+            self.fail_manifest_delete_enabled = true;
+        }
+
+        fn clear_manifest_delete_failure(&mut self) {
+            self.fail_manifest_delete_enabled = false;
+        }
+
+        fn fail_root_save(&mut self) {
+            self.fail_root_save_enabled = true;
+        }
+
+        fn clear_root_save_failure(&mut self) {
+            self.fail_root_save_enabled = false;
+        }
+
+        fn document_count(&self) -> usize {
+            self.inner.document_count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::vault::storage::VaultStorage for FaultInjectingStorage {
+        async fn save_manifest(
+            &mut self,
+            manifest: &crate::crypto::encryption::EncryptedData,
+        ) -> Result<String, CryptoError> {
+            if self.manifest_saves_before_failure == 0 {
+                return Err(CryptoError::StorageUnavailable);
+            }
+
+            self.manifest_saves_before_failure -= 1;
+
+            self.inner.save_manifest(manifest).await
+        }
+
+        async fn load_manifest(
+            &self,
+        ) -> Result<crate::vault::storage::ManifestStorageRecord, CryptoError> {
+            self.inner.load_manifest().await
+        }
+        async fn list_manifest_cids(&self) -> Result<Vec<String>, CryptoError> {
+            self.inner.list_manifest_cids().await
+        }
+
+        async fn delete_manifest(&mut self, cid: &str) -> Result<(), CryptoError> {
+            if self.fail_manifest_delete_enabled {
+                return Err(CryptoError::StorageUnavailable);
+            }
+
+            self.inner.delete_manifest(cid).await
+        }
+
+        async fn save_identity(
+            &mut self,
+            identity: &crate::vault::identity_storage::IdentityStorageRecord,
+        ) -> Result<String, CryptoError> {
+            self.inner.save_identity(identity).await
+        }
+
+        async fn load_identity(
+            &self,
+        ) -> Result<crate::vault::identity_storage::IdentityStorageRecord, CryptoError> {
+            self.inner.load_identity().await
+        }
+
+        async fn store_document(
+            &mut self,
+            document: crate::crypto::encrypted_document::EncryptedDocument,
+        ) -> Result<String, CryptoError> {
+            self.inner.store_document(document).await
+        }
+
+        async fn load_document(
+            &self,
+            cid: &str,
+        ) -> Result<crate::crypto::encrypted_document::EncryptedDocument, CryptoError> {
+            self.inner.load_document(cid).await
+        }
+
+        async fn delete_document(&mut self, cid: &str) -> Result<(), CryptoError> {
+            if self.fail_document_delete {
+                return Err(CryptoError::StorageUnavailable);
+            }
+
+            self.inner.delete_document(cid).await
+        }
+
+        async fn list_document_cids(&self) -> Result<Vec<String>, CryptoError> {
+            self.inner.list_document_cids().await
+        }
+
+        async fn save_root(&mut self, root: &VaultRoot) -> Result<String, CryptoError> {
+            if self.fail_root_save_enabled {
+                return Err(CryptoError::StorageUnavailable);
+            }
+
+            self.inner.save_root(root).await
+        }
+
+        async fn load_root(&self) -> Result<crate::vault::root::VaultRoot, CryptoError> {
+            self.inner.load_root().await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_manifest_commit_preserves_vault_state_and_allows_retry() {
+        let password = b"manifest-retry-state-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(5);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        // ------------------------------------------------------------
+        // 1. Create an initial committed document.
+        // ------------------------------------------------------------
+        let original_cid = vault
+            .add_document("original", b"original document")
+            .await
+            .expect("original document should be added");
+
+        let original_root = vault.vault_root.clone().expect("vault root should exist");
+
+        // ------------------------------------------------------------
+        // 2. Force both root persistence and manifest cleanup to fail.
+        // ------------------------------------------------------------
+        vault.storage_mut().fail_root_save();
+        vault.storage_mut().fail_manifest_delete();
+
+        let result = vault.add_document("failed", b"failed document").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // ------------------------------------------------------------
+        // 3. The committed root must still point to the original
+        //    manifest.
+        // ------------------------------------------------------------
+        let current_root = vault
+            .vault_root
+            .clone()
+            .expect("vault root should still exist");
+
+        assert_eq!(current_root.manifest_cid, original_root.manifest_cid);
+
+        // ------------------------------------------------------------
+        // 4. The original document must remain accessible.
+        // ------------------------------------------------------------
+        let document = vault
+            .get_document("original")
+            .await
+            .expect("original document should remain accessible");
+
+        assert_eq!(document, b"original document");
+
+        // ------------------------------------------------------------
+        // 5. The failed document must not remain in the committed
+        //    in-memory manifest.
+        // ------------------------------------------------------------
+        let failed_document = vault.get_document("failed").await;
+
+        assert!(matches!(
+            failed_document,
+            Err(CryptoError::DocumentNotFound)
+        ));
+
+        // ------------------------------------------------------------
+        // 6. Because manifest cleanup was intentionally forced to
+        //    fail, there should be at least one orphaned manifest.
+        //
+        //    NOTE:
+        //    MemoryStorage preserves previous manifest revisions.
+        //    Therefore there may be more than one orphan here.
+        // ------------------------------------------------------------
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert!(
+            !orphaned_manifests.is_empty(),
+            "failed manifest commit should leave at least one recoverable orphan"
+        );
+
+        // ------------------------------------------------------------
+        // 7. Clear both simulated storage failures.
+        // ------------------------------------------------------------
+        vault.storage_mut().clear_root_save_failure();
+
+        vault.storage_mut().clear_manifest_delete_failure();
+
+        // ------------------------------------------------------------
+        // 8. Remove every currently detected orphaned manifest.
+        //
+        //    This is necessary because MemoryStorage retains historical
+        //    manifest revisions, not just the manifest created by the
+        //    failed transaction.
+        // ------------------------------------------------------------
+        for orphan_cid in orphaned_manifests {
+            vault
+                .remove_orphaned_manifest(&orphan_cid)
+                .await
+                .expect("orphaned manifest should be removable");
+        }
+
+        // Confirm that all currently stored non-current manifests
+        // have been removed.
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert!(
+            orphaned_manifests.is_empty(),
+            "all detected orphaned manifests should be removable"
+        );
+
+        // ------------------------------------------------------------
+        // 9. Retry the operation after storage recovery.
+        // ------------------------------------------------------------
+        let retry_cid = vault
+            .add_document("retry", b"retry document")
+            .await
+            .expect("retry document should be added");
+
+        assert_ne!(retry_cid, original_cid);
+
+        // ------------------------------------------------------------
+        // 10. The original document must still be accessible.
+        // ------------------------------------------------------------
+        let original_document = vault
+            .get_document("original")
+            .await
+            .expect("original document should remain accessible");
+
+        assert_eq!(original_document, b"original document");
+
+        // ------------------------------------------------------------
+        // 11. The retried document must be accessible.
+        // ------------------------------------------------------------
+        let retry_document = vault
+            .get_document("retry")
+            .await
+            .expect("retry document should be accessible");
+
+        assert_eq!(retry_document, b"retry document");
+
+        // ------------------------------------------------------------
+        // 12. The retry must have produced a new committed root.
+        // ------------------------------------------------------------
+        let final_root = vault
+            .vault_root
+            .clone()
+            .expect("final vault root should exist");
+
+        assert_ne!(final_root.manifest_cid, original_root.manifest_cid);
+
+        // ------------------------------------------------------------
+        // 13. Verify the current root points to the latest committed
+        //     manifest.
+        // ------------------------------------------------------------
+        let stored_manifest = vault
+            .storage
+            .load_manifest()
+            .await
+            .expect("latest manifest should be loadable");
+
+        assert_eq!(stored_manifest.cid, final_root.manifest_cid);
+
+        // ------------------------------------------------------------
+        // IMPORTANT:
+        //
+        // After the successful retry, MemoryStorage creates another
+        // manifest revision. The previous manifest is therefore again
+        // considered an orphan by find_orphaned_manifests().
+        //
+        // We should NOT assert that the orphan list is empty here.
+        // Instead, verify that the current root's manifest is NOT
+        // considered an orphan.
+        // ------------------------------------------------------------
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert!(
+            !orphaned_manifests
+                .iter()
+                .any(|cid| cid == &final_root.manifest_cid),
+            "the committed manifest must never be reported as orphaned"
+        );
+    }
+    #[tokio::test]
+    async fn delete_document_manifest_save_failure_does_not_leave_missing_document_reference() {
+        let password = b"delete-manifest-save-failure-test";
+
+        // Save #1: vault creation.
+        // Save #2: adding the document.
+        // Save #3: deletion, which will fail.
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(2);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        vault
+            .add_document("doc-1", b"secret document")
+            .await
+            .expect("document creation should succeed");
+
+        let result = vault.delete_document("doc-1").await;
+
+        assert!(
+            matches!(result, Err(CryptoError::StorageUnavailable)),
+            "delete_document should report the manifest storage failure"
+        );
+
+        // The document should still be available because the deletion
+        // operation was not successfully committed.
+        let result = vault.get_document("doc-1").await;
+
+        assert!(
+            result.is_ok(),
+            "failed document deletion should not make the document inaccessible"
+        );
+
+        let manifest = vault.manifest().expect("vault should remain unlocked");
+
+        assert!(
+            manifest.find_document("doc-1").is_some(),
+            "failed document deletion should leave the manifest entry intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_orphaned_manifest_failure_leaves_orphan_detectable() {
+        let password = b"manifest-delete-failure-test";
+
+        let mut vault = VaultManager::create(
+            password,
+            FaultInjectingStorage::fail_after_manifest_saves(10),
+        )
+        .await
+        .expect("vault creation should succeed");
+
+        let current_manifest_cid = vault
+            .manifest_cid()
+            .expect("current manifest CID should exist")
+            .to_string();
+
+        let replacement_manifest = VaultManifest::new();
+
+        let orphaned_encrypted_manifest = VaultManager::<FaultInjectingStorage>::encrypt_manifest(
+            &vault.keys.manifest_key,
+            &replacement_manifest,
+        )
+        .expect("replacement manifest encryption should succeed");
+
+        let orphaned_cid = vault
+            .storage_mut()
+            .save_manifest(&orphaned_encrypted_manifest)
+            .await
+            .expect("orphaned manifest should be stored");
+
+        assert_ne!(current_manifest_cid, orphaned_cid);
+
+        let orphans = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![orphaned_cid.clone()]);
+
+        vault.storage_mut().fail_manifest_delete();
+
+        let result = vault.remove_orphaned_manifest(&orphaned_cid).await;
+
+        assert!(
+            result.is_err(),
+            "manifest deletion should fail when storage failure is injected"
+        );
+
+        let orphans_after_failure = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphan detection should still succeed");
+
+        assert_eq!(
+            orphans_after_failure,
+            vec![orphaned_cid.clone()],
+            "failed deletion must leave the orphan detectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_save_root_failure_with_cleanup_failure_leaves_recoverable_orphan() {
+        let password = b"manifest-cleanup-failure-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let original_root = vault.vault_root.clone().expect("vault root should exist");
+
+        // Force the root update to fail.
+        vault.storage_mut().fail_root_save();
+
+        // Also force cleanup of the newly stored manifest to fail.
+        vault.storage_mut().fail_manifest_delete();
+
+        let result = vault.add_document("doc-1", b"document").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The original root must remain authoritative.
+        let current_root = vault
+            .vault_root
+            .clone()
+            .expect("vault root should still exist");
+
+        assert_eq!(current_root.manifest_cid, original_root.manifest_cid);
+
+        // Because cleanup failed, the newly stored manifest should
+        // remain detectable as an orphan.
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert_eq!(orphaned_manifests.len(), 1);
+
+        assert_ne!(orphaned_manifests[0], original_root.manifest_cid);
+
+        // Clear the simulated cleanup failure.
+        vault.storage_mut().clear_manifest_delete_failure();
+
+        // The orphan should now be recoverable.
+        let orphan_cid = orphaned_manifests[0].clone();
+
+        vault
+            .remove_orphaned_manifest(&orphan_cid)
+            .await
+            .expect("orphaned manifest should be removable after recovery");
+
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert!(
+            orphaned_manifests.is_empty(),
+            "recovered manifest orphan should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_save_root_failure_preserves_previous_root() {
+        let password = b"manifest-root-failure-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let original_root = vault.vault_root.clone().expect("vault root should exist");
+
+        vault.storage_mut().fail_root_save();
+
+        let result = vault.add_document("doc-1", b"document");
+
+        let result = result.await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        let current_root = vault
+            .vault_root
+            .clone()
+            .expect("vault root should still exist");
+
+        assert_eq!(current_root.manifest_cid, original_root.manifest_cid);
+    }
+    #[tokio::test]
+    async fn remove_orphaned_manifest_can_be_retried_after_failure() {
+        let password = b"manifest-delete-retry-test";
+
+        let mut vault = VaultManager::create(
+            password,
+            FaultInjectingStorage::fail_after_manifest_saves(10),
+        )
+        .await
+        .expect("vault creation should succeed");
+
+        let current_manifest_cid = vault
+            .manifest_cid()
+            .expect("current manifest CID should exist")
+            .to_string();
+
+        let replacement_manifest = VaultManifest::new();
+
+        let orphaned_encrypted_manifest = VaultManager::<FaultInjectingStorage>::encrypt_manifest(
+            &vault.keys.manifest_key,
+            &replacement_manifest,
+        )
+        .expect("replacement manifest encryption should succeed");
+
+        let orphaned_cid = vault
+            .storage_mut()
+            .save_manifest(&orphaned_encrypted_manifest)
+            .await
+            .expect("orphaned manifest should be stored");
+
+        assert_ne!(current_manifest_cid, orphaned_cid);
+
+        vault.storage_mut().fail_manifest_delete();
+
+        let failed_result = vault.remove_orphaned_manifest(&orphaned_cid).await;
+
+        assert!(failed_result.is_err(), "first deletion attempt should fail");
+
+        vault.storage_mut().clear_manifest_delete_failure();
+
+        vault
+            .remove_orphaned_manifest(&orphaned_cid)
+            .await
+            .expect("retry should successfully remove the orphan");
+
+        let orphans = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphan detection should succeed after retry");
+
+        assert!(
+            orphans.is_empty(),
+            "successfully removed orphan must no longer be detectable"
+        );
+
+        assert_eq!(
+            vault
+                .manifest_cid()
+                .expect("current manifest CID should still exist"),
+            current_manifest_cid,
+            "removing an orphan must not change the committed manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_orphaned_document_rejects_referenced_document() {
+        let password = b"referenced-document-protection-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid = vault
+            .add_document("doc-1", b"valid document")
+            .await
+            .expect("document creation should succeed");
+
+        let result = vault.remove_orphaned_document(&cid).await;
+
+        assert!(
+            matches!(result, Err(CryptoError::DocumentNotFound)),
+            "a manifest-referenced document must not be removable as an orphan"
+        );
+
+        // The document must still be accessible.
+        let document = vault
+            .get_document("doc-1")
+            .await
+            .expect("referenced document should remain accessible");
+
+        assert_eq!(document, b"valid document");
+
+        // There must still be no orphans.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert!(
+            orphans.is_empty(),
+            "a valid document must not become an orphan"
+        );
+    }
 
     #[tokio::test]
     async fn creates_encrypted_manifest() {
@@ -553,6 +1453,507 @@ mod tests {
         let stored_identity_cid = vault.identity_cid().expect("identity CID should exist");
 
         assert_eq!(root.identity_cid(), stored_identity_cid);
+    }
+    #[tokio::test]
+    async fn add_document_manifest_save_failure_does_not_leave_orphaned_document() {
+        let password = b"manifest-save-failure-test";
+
+        // The first manifest save happens during vault creation.
+        // The second manifest save will fail.
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(1);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let result = vault.add_document("doc-1", b"secret document").await;
+
+        assert!(
+            matches!(result, Err(CryptoError::StorageUnavailable)),
+            "add_document should report the manifest storage failure"
+        );
+
+        // The failed operation should not leave the document accessible
+        // through the manager's in-memory manifest.
+        let result = vault.get_document("doc-1").await;
+
+        assert!(
+            matches!(result, Err(CryptoError::DocumentNotFound)),
+            "failed document addition should not remain in the manifest"
+        );
+
+        // The encrypted document should also have been rolled back
+        // from storage.
+        let storage = vault.into_storage();
+
+        assert_eq!(
+            storage.document_count(),
+            0,
+            "failed document addition should not leave an orphaned document"
+        );
+    }
+    #[tokio::test]
+    async fn find_orphaned_documents_detects_storage_orphan() {
+        let password = b"orphan-detection-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid = vault
+            .add_document("doc-1", b"secret document")
+            .await
+            .expect("document creation should succeed");
+
+        vault.storage_mut().fail_document_delete();
+
+        let result = vault.delete_document("doc-1").await;
+
+        assert!(
+            matches!(result, Err(CryptoError::StorageUnavailable)),
+            "physical deletion should fail"
+        );
+
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(
+            orphans,
+            vec![cid],
+            "the physically retained document should be detected as an orphan"
+        );
+    }
+    #[tokio::test]
+    async fn find_orphaned_manifests_detects_storage_orphan() {
+        let password = b"manifest-orphan-detection-test";
+
+        let mut vault = VaultManager::create(password, test_storage())
+            .await
+            .expect("vault creation should succeed");
+
+        let current_manifest_cid = vault
+            .manifest_cid()
+            .expect("current manifest CID should exist")
+            .to_string();
+
+        // Create another valid encrypted manifest object in storage.
+        //
+        // This object is intentionally not committed through VaultRoot.
+        let replacement_manifest = VaultManifest::new();
+
+        let orphaned_encrypted_manifest = VaultManager::<MemoryStorage>::encrypt_manifest(
+            &vault.keys.manifest_key,
+            &replacement_manifest,
+        )
+        .expect("replacement manifest encryption should succeed");
+
+        let orphaned_cid = vault
+            .storage_mut()
+            .save_manifest(&orphaned_encrypted_manifest)
+            .await
+            .expect("orphaned manifest should be stored");
+
+        assert_ne!(
+            current_manifest_cid, orphaned_cid,
+            "the orphaned manifest must have a different CID"
+        );
+
+        let orphans = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("manifest orphan detection should succeed");
+
+        assert_eq!(
+            orphans,
+            vec![orphaned_cid],
+            "the uncommitted manifest should be detected as an orphan"
+        );
+    }
+    #[tokio::test]
+    async fn find_orphaned_manifests_ignores_current_manifest() {
+        let password = b"manifest-current-test";
+
+        let vault = VaultManager::create(password, test_storage())
+            .await
+            .expect("vault creation should succeed");
+
+        let current_manifest_cid = vault
+            .manifest_cid()
+            .expect("current manifest CID should exist")
+            .to_string();
+
+        let orphans = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("manifest orphan detection should succeed");
+
+        assert!(
+            !orphans.contains(&current_manifest_cid),
+            "the committed manifest must never be reported as an orphan"
+        );
+
+        assert!(
+            orphans.is_empty(),
+            "a newly created vault should have no orphaned manifests"
+        );
+    }
+    #[tokio::test]
+    async fn remove_orphaned_document_removes_storage_object() {
+        let password = b"orphan-removal-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid = vault
+            .add_document("doc-1", b"orphaned document")
+            .await
+            .expect("document creation should succeed");
+
+        // Force the physical deletion to fail so the document becomes an orphan.
+        vault.storage_mut().fail_document_delete();
+
+        let result = vault.delete_document("doc-1").await;
+
+        assert!(
+            matches!(result, Err(CryptoError::StorageUnavailable)),
+            "physical deletion should fail"
+        );
+
+        // Confirm the orphan exists.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![cid.clone()]);
+
+        // Allow physical deletion again.
+        vault.storage_mut().clear_document_delete_failure();
+
+        vault
+            .remove_orphaned_document(&cid)
+            .await
+            .expect("orphan removal should succeed");
+
+        // The orphan should now be gone.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert!(orphans.is_empty(), "removed orphan should no longer exist");
+    }
+
+    #[tokio::test]
+    async fn remove_orphaned_document_failure_leaves_orphan_detectable() {
+        let password = b"orphan-removal-failure-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid = vault
+            .add_document("doc-1", b"orphaned document")
+            .await
+            .expect("document should be added");
+
+        // Force the normal document deletion to fail, creating an orphan.
+        vault.storage_mut().fail_document_delete();
+
+        let result = vault.delete_document("doc-1").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The document must now be an orphan.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![cid.clone()]);
+
+        // Force the orphan cleanup deletion to fail as well.
+        vault.storage_mut().fail_document_delete();
+
+        // Attempt orphan removal while storage deletion is failing.
+        let result = vault.remove_orphaned_document(&cid).await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The orphan must still exist and remain detectable.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should still succeed");
+
+        assert_eq!(orphans, vec![cid]);
+    }
+    #[tokio::test]
+    async fn remove_orphaned_document_can_be_retried_after_failure() {
+        let password = b"orphan-retry-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid = vault
+            .add_document("doc-1", b"orphaned document")
+            .await
+            .expect("document should be added");
+
+        // Create an orphan by forcing physical document deletion to fail.
+        vault.storage_mut().fail_document_delete();
+
+        let result = vault.delete_document("doc-1").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The document should now exist in storage but no longer be
+        // referenced by the manifest.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![cid.clone()]);
+
+        // Keep document deletion failure enabled so the first orphan
+        // cleanup attempt fails.
+        let result = vault.remove_orphaned_document(&cid).await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The orphan must still be present after the failed cleanup.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![cid.clone()]);
+
+        // Clear the simulated storage failure before retrying.
+        vault.storage_mut().clear_document_delete_failure();
+
+        // Retry the cleanup after the storage failure has cleared.
+        vault
+            .remove_orphaned_document(&cid)
+            .await
+            .expect("orphan cleanup retry should succeed");
+
+        // The orphan should now be gone.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert!(orphans.is_empty());
+    }
+    #[tokio::test]
+    async fn find_orphaned_documents_handles_multiple_orphans_independently() {
+        let password = b"multiple-orphans-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(6);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid_a = vault
+            .add_document("doc-a", b"document A")
+            .await
+            .expect("document A should be added");
+
+        let cid_b = vault
+            .add_document("doc-b", b"document B")
+            .await
+            .expect("document B should be added");
+
+        let cid_c = vault
+            .add_document("doc-c", b"document C")
+            .await
+            .expect("document C should be added");
+
+        // Make document A an orphan.
+        vault.storage_mut().fail_document_delete();
+
+        let result = vault.delete_document("doc-a").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // Make document B an orphan.
+        let result = vault.delete_document("doc-b").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // Document C remains valid and referenced by the manifest.
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.contains(&cid_a));
+        assert!(orphans.contains(&cid_b));
+        assert!(!orphans.contains(&cid_c));
+
+        // Clear the simulated storage failure before orphan cleanup.
+        vault.storage_mut().clear_document_delete_failure();
+
+        // Remove only orphan A.
+        vault
+            .remove_orphaned_document(&cid_a)
+            .await
+            .expect("orphan A should be removable");
+
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert_eq!(orphans, vec![cid_b.clone()]);
+
+        // Document C must still be accessible.
+        let document = vault
+            .get_document("doc-c")
+            .await
+            .expect("document C should remain accessible");
+
+        assert_eq!(document, b"document C");
+
+        // Remove orphan B.
+        vault
+            .remove_orphaned_document(&cid_b)
+            .await
+            .expect("orphan B should be removable");
+
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert!(orphans.is_empty());
+
+        // Document C must still be accessible after all orphan cleanup.
+        let document = vault
+            .get_document("doc-c")
+            .await
+            .expect("document C should remain accessible");
+
+        assert_eq!(document, b"document C");
+    }
+    #[tokio::test]
+    async fn find_orphaned_documents_ignores_valid_documents() {
+        let password = b"orphan-valid-document-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let cid = vault
+            .add_document("doc-1", b"valid document")
+            .await
+            .expect("document creation should succeed");
+
+        let orphans = vault
+            .find_orphaned_documents()
+            .await
+            .expect("orphan detection should succeed");
+
+        assert!(
+            !orphans.contains(&cid),
+            "a document referenced by the manifest must not be reported as an orphan"
+        );
+
+        assert!(orphans.is_empty(), "there should be no orphaned documents");
+    }
+
+    #[tokio::test]
+    async fn manifest_save_root_failure_does_not_leave_new_manifest_as_orphan() {
+        let password = b"manifest-root-no-orphan-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let original_root = vault.vault_root.clone().expect("vault root should exist");
+
+        vault.storage_mut().fail_root_save();
+
+        let result = vault.add_document("doc-1", b"document").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The root must still point to the original manifest.
+        let current_root = vault
+            .vault_root
+            .clone()
+            .expect("vault root should still exist");
+
+        assert_eq!(current_root.manifest_cid, original_root.manifest_cid);
+
+        // The failed manifest commit must be cleaned up.
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert!(
+            orphaned_manifests.is_empty(),
+            "failed manifest commit should not leave an orphaned manifest"
+        );
+    }
+    #[tokio::test]
+    async fn manifest_save_root_failure_cleans_up_new_manifest() {
+        let password = b"manifest-root-cleanup-test";
+
+        let storage = FaultInjectingStorage::fail_after_manifest_saves(3);
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let original_root = vault.vault_root.clone().expect("vault root should exist");
+
+        vault.storage_mut().fail_root_save();
+
+        let result = vault.add_document("doc-1", b"document").await;
+
+        assert!(matches!(result, Err(CryptoError::StorageUnavailable)));
+
+        // The root must still point to the original manifest.
+        let current_root = vault
+            .vault_root
+            .clone()
+            .expect("vault root should still exist");
+
+        assert_eq!(current_root.manifest_cid, original_root.manifest_cid);
+
+        // The failed manifest commit must not leave an orphaned
+        // manifest in storage.
+        let orphaned_manifests = vault
+            .find_orphaned_manifests()
+            .await
+            .expect("orphaned manifest detection should succeed");
+
+        assert!(
+            orphaned_manifests.is_empty(),
+            "failed manifest commit should not leave an orphaned manifest"
+        );
     }
 
     #[tokio::test]
@@ -860,6 +2261,64 @@ mod tests {
         let updated_cid = vault.manifest_cid().unwrap().to_string();
 
         assert_ne!(initial_cid, updated_cid);
+    }
+    #[tokio::test]
+    async fn save_manifest_root_failure_does_not_update_manager_manifest_cid() {
+        let password = b"root-save-failure-test";
+
+        let storage = FailingRootStorage::new();
+
+        let mut vault = VaultManager::create(password, storage)
+            .await
+            .expect("vault creation should succeed");
+
+        let original_manifest_cid = vault
+            .manifest_cid()
+            .expect("manifest CID should exist")
+            .to_string();
+
+        let original_root = vault.vault_root().expect("vault root should exist").clone();
+
+        // The next save_root() must fail.
+        vault.storage_mut().fail_root_save();
+
+        let result = vault.add_document("doc-1", b"secret document").await;
+
+        assert!(
+            matches!(result, Err(CryptoError::StorageUnavailable)),
+            "document addition should fail when root persistence fails"
+        );
+
+        // The in-memory manifest entry is rolled back by add_document().
+        let manifest = vault.manifest().expect("vault should remain unlocked");
+
+        assert!(
+            manifest.find_document("doc-1").is_none(),
+            "failed document addition must not remain in the manifest"
+        );
+
+        // The persisted root must still contain the original manifest CID.
+        let stored_root = vault
+            .storage()
+            .load_root()
+            .await
+            .expect("stored root should still exist");
+
+        assert_eq!(
+            stored_root.manifest_cid, original_manifest_cid,
+            "persisted root must still reference the previously committed manifest"
+        );
+
+        // The manager's root currently needs to be checked explicitly.
+        let manager_root = vault
+            .vault_root()
+            .expect("manager should still have a vault root");
+
+        assert_eq!(
+        manager_root.manifest_cid,
+        original_root.manifest_cid,
+        "failed root persistence must not leave the manager root pointing at an uncommitted manifest"
+    );
     }
 
     #[tokio::test]
